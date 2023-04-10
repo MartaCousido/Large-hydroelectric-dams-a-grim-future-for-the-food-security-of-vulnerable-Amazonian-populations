@@ -1,0 +1,645 @@
+---
+title: ""
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    number_sections: no
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    number_sections: no
+    toc: yes
+---
+
+
+# Food security of vulnerable Amazonian populations affected by large hydroelectric dams {.tabset}
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lubridate)
+source("HighstatLibV10.R")
+library(lattice)
+library(INLA)
+library(ggplot2)
+library("bayesplot")
+library("ggplot2")
+library("rstanarm")
+```
+
+
+## Data {.tabset}
+
+
+```{r}
+library(readxl)
+data<- read_excel("data_yes.xlsx",sheet = 1)
+data$DATA=as.Date(data$DATA,format="%y-%m-%d")
+data$TOTAL_RIQUEZA_PEIXES=as.numeric(data$TOTAL_RIQUEZA_PEIXES)
+data$`Total_Peixes(g)`=as.numeric(data$`Total_Peixes(g)`)
+head(data)
+```
+
+**Including river level rate covariable:** code for merging both data sets.
+
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+vazao <- read_excel("Dados_Cota_BM.xlsx",sheet=5)
+
+vazao$DATA=as.Date(vazao$DATA,format="%y-%m-%d")
+
+names_d=unique(data$INFLUENCIA)
+names_v=unique(vazao$cod)
+
+
+
+aa=subset(vazao, vazao$cod=="Jusante")
+aa$cod=rep("DOWNSTREAM_RURAL",dim(aa)[1])
+vazao=rbind(vazao,aa)
+
+
+ind1=which(vazao$cod=="Jusante")
+vazao[ind1,3]="DOWNSTREAM_URBAN"
+
+ind1=which(vazao$cod=="Reservatório")
+vazao[ind1,3]="RESERVOIR_RURAL"
+
+
+ind1=which(vazao$cod=="VoltaGrande")
+vazao[ind1,3]="DEWATERED_REACH_RURAL"
+
+ind1=which(vazao$cod=="RESERVOIR_RURAL")
+aux=vazao[ind1,]
+aux[,3]="RESERVOIR_URBAN"
+vazao=rbind(vazao, aux)
+
+colnames(vazao)=c("Codigo",	"Estacion",	"cod",	"DATA",	"ANO",	"MES",	"Cota(cm)")
+vazao$newdate=(vazao$DATA)
+data$newdate=(data$DATA)
+l=dim(data)[1]
+
+data$vazao=1:l
+j=dim(data)[2]
+
+for(i in 1:l){
+  f=data[i,]$newdate
+  a=data[i,]$INFLUENCIA
+  b=subset(vazao,vazao$newdate==f)
+  c=subset(b,b$cod==a)
+  if(dim(c)[1]>0) {data[i,j]=c$`Cota(cm)`} else {data[i,j]=NA}
+}
+head(data)
+```
+
+
+## Previous steps {.tabset}
+
+### Check TOTAL_RIQUEZA_PEIXES {.tabset}
+
+<span style="color:blue">After replacing 0 by NA when `Total_Peixes(g)`>0 and 1 by NA when `Total_Peixes(g)`=0.</span>
+
+
+- Values of  TOTAL_RIQUEZA_PEIXES if `Total_Peixes(g)`=0.
+```{r}
+a=subset(data,data$`Total_Peixes(g)`==0)
+summary(a$TOTAL_RIQUEZA_PEIXES)
+```
+- Values of  TOTAL_RIQUEZA_PEIXES if `Total_Peixes(g)`>0.
+
+```{r}
+b=subset(data,data$`Total_Peixes(g)`>0)
+summary(b$TOTAL_RIQUEZA_PEIXES)
+table(b$TOTAL_RIQUEZA_PEIXES)
+```
+
+
+In previous analysis the values of TOTAL_RIQUEZA_PEIXES>=3 had been eliminated.
+
+```{r}
+dim(data)
+
+ind=which(data$TOTAL_RIQUEZA_PEIXES==3)
+ind1=which(data$TOTAL_RIQUEZA_PEIXES==4)
+ind2=which(data$TOTAL_RIQUEZA_PEIXES==5)
+
+data=data[-c(ind1,ind,ind2),]
+table(data$TOTAL_RIQUEZA_PEIXES)
+```
+
+### Defining response variables (dealing with the dependency problem) {.tabset}
+
+Presence/absence of fish consumption.
+
+```{r}
+data$pres<-ifelse(data$`Total_Peixes(g)`>0,1,0)
+table(data$pres)
+```
+
+Fish intake.
+
+```{r}
+data$consumo=data$`Total_Peixes(g)`/data$NUMERO.DE.PESSSOAS
+```
+
+We compute its mean by groups. We take into account in the process the different categories of "Localidade" and "Influencia" covariables.
+
+```{r,message=FALSE, warning=FALSE}
+library(dplyr)
+
+f=function(x){mean(x,na.rm=TRUE)}
+data1=data %>%
+  group_by(DATA,LOCALIDADE,INFLUENCIA) %>%
+  summarise_at(vars(c(pres,vazao,consumo,TOTAL_RIQUEZA_PEIXES)), f)
+head(data1)
+
+# Number of zeros
+sum(data1$pres==0)/length(data1$pres)
+# Number of 1's
+sum(data1$pres==1)/length(data1$pres)
+```
+
+### Presence/absence mean {.tabset}
+
+The most appropriate model for the mean of presence/absence of fish consumption is a beta model with a logistic
+link as it will ensure that fitted values are always between 0 and 1. The crucial point is that the response variable must take values between 0
+and 1, excluding the boundaries. Hence it is necessary to apply a 
+simple transformation 
+(Smithson and Verkuilen, 2006):
+
+$$(Y_i × (N – 1) + 0.5) / N,$$
+where $N$ is the sample size.
+
+
+```{r}
+N <- nrow(data1)
+data1$pres_bound=(data1$pres * (N - 1) + 0.5 ) / N
+summary(data1$pres_bound)
+boxplot(data1$pres_bound,col="gold")
+```
+
+### Exploratory of consumo response variable {.tabset}
+
+
+```{r}
+summary(data1$consumo)
+sum(data1$consumo==0)/length(data1$consumo)
+boxplot(data1$consumo,col="gold")
+```
+
+### Defining time and season covariables {.tabset}
+
+Seasonal variable
+
+
+```{r, message=FALSE}
+
+data1$newdate=(data1$DATA)
+data1$season=yday(data1$newdate)
+# Interesting link: https://data.library.virginia.edu/working-with-dates-and-time-in-r-us## ing-the-lubridate-package/
+summary(data1$season)
+```
+
+Continuous time variable
+
+```{r}
+data1$Time <- julian(data1$newdate, origin = as.Date("2012-07-17"))
+summary(data1$Time)
+```
+
+
+
+### Exploratory covariables {.tabset}
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+Myvar=c(6,8,5,7,10,11)
+
+corvif(data1[,Myvar[-(1:2)]])
+
+
+Mypairs(data1[,Myvar[-c(1,4)]])
+data0=subset(data1,data1$consumo>0)
+Mypairs(data0[,Myvar[-2]])
+cor.test(data1$vazao,data1$season)
+par(mfcol=c(2,2))
+boxplot(data1[,Myvar[3]],main="River level",col="gold")
+boxplot(data1[,Myvar[4]],main="TOTAL_RIQUEZA_PEIXES",col="gold")
+boxplot(data1[,Myvar[5]],main="season",col="gold")
+boxplot(data1[,Myvar[6]],main="Time",col="gold")
+
+
+```
+
+
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+table(data1$INFLUENCIA)
+l=dim(data1)[1]
+library(ggplot2)
+ggplot(data1, aes(x=INFLUENCIA, y=consumo ,fill=INFLUENCIA)) + 
+  geom_boxplot()+ theme(axis.title.x=element_blank(),
+                        axis.text.x=element_blank(),
+                        axis.ticks.x=element_blank())
+
+```
+
+
+
+
+
+
+
+## Models {.tabset}
+
+
+```{r,message=FALSE,warning=FALSE}
+library(INLA)
+```
+
+
+
+
+
+
+```{r,warning=FALSE,message=FALSE, include=FALSE}
+### GAMs {.tabset}
+
+
+## 1. For beta model.
+
+#Basis dimension (k) checking results. Low p-value (k-index<1) may
+#indicate that k is too low, especially if edf is close to k'.
+library(mgcv)
+G1 <- gam(data1$pres_bound ~ s(data1$Time, k =-1)+s(data1$vazao, k =-1)+data1$INFLUENCIA, data = data1, family=betar(link="logit"))
+summary(G1)
+a=k.check(G1)
+a
+plot(G1)
+
+
+```
+
+
+
+
+
+
+
+```{r,include=FALSE}
+# 2. For gamma model.
+data1$consumopos <- ifelse(data1$consumo>0,data1$consumo,NA)
+data1$TOTAL_RIQUEZA_PEIXES<-ifelse(data1$TOTAL_RIQUEZA_PEIXES>0,data1$TOTAL_RIQUEZA_PEIXES,NA)
+G1 <- gam(data1$consumopos ~ s(data1$Time, k =-1)+s(data1$vazao, k =-1)+data1$INFLUENCIA+s(data1$TOTAL_RIQUEZA_PEIXES, k =-1), data = data1, family=Gamma(link = "log"))
+summary(G1)
+a=k.check(G1)
+a
+plot(G1)
+```
+
+
+### INLA models {.tabset}
+
+
+```{r}
+
+
+N <- nrow(data1)
+Xgamma <- data.frame(Intercgamma = rep(1, N), 
+                    INFLUENCIAgamma   = (data1$INFLUENCIA),
+                    TOTAL_RIQUEZA_PEIXESgamma=data1$TOTAL_RIQUEZA_PEIXES,
+                    seasongamma=data1$season,
+                    Timegamma=data1$Time,
+                    vazaogamma=data1$vazao,
+                    grouped_Timegamma = inla.group(data1$Time,n=10),
+                    grouped_seasongamma = inla.group(data1$season,n=10),
+                    grouped_vazaogamma = inla.group(data1$vazao,n=8),
+                    grouped_riqueza_gamma = inla.group(data1$TOTAL_RIQUEZA_PEIXES,n=15))
+
+
+Xbeta <- data.frame(Intercbeta = rep(1, N), 
+                    INFLUENCIAbeta   = (data1$INFLUENCIA),
+                    TOTAL_RIQUEZA_PEIXESbeta=data1$TOTAL_RIQUEZA_PEIXES,
+                    seasonbeta=data1$season,
+                    Timebeta=data1$Time,
+                    vazaobeta=data1$vazao,
+                    grouped_Timebeta = inla.group(data1$Time,n=10),
+                    grouped_seasonbeta = inla.group(data1$season,n=10),
+                    grouped_vazaobeta = inla.group(data1$vazao,n=8),
+                    grouped_riqueza_beta = inla.group(data1$TOTAL_RIQUEZA_PEIXES,n=15) )
+```
+
+
+
+```{r}
+
+
+Stackgamma <- inla.stack(
+  tag  = "FitGamma",
+  data = list(AllY = cbind(data1$consumopos, NA)),  
+  A    = list(1),                      
+  effects = list(                 
+    list(Xgamma = Xgamma))) 
+
+
+Stackbeta <- inla.stack(
+  tag  = "FitBeta",
+  data = list(AllY = cbind(NA, data1$pres_bound)),  
+  A    = list(1),                      
+  effects = list(                 
+    list(Xbeta = Xbeta)))
+
+# Combined stack
+Stack4 <- inla.stack(Stackgamma,Stackbeta)
+```
+
+
+
+
+
+#### First model (FULL) {.tabset}
+
+```{r}
+f4 <- AllY~ -1+
+  Intercbeta+
+  f(INFLUENCIAbeta, model = "iid",hyper = list(prec =    list(initial =log(10^{-5}), fixed =TRUE))) + 
+  f(grouped_Timebeta,model = "rw2")+
+  f(grouped_vazaobeta, model = "rw2")+
+  f(grouped_seasonbeta,cyclic=T, model = "rw2")+
+  Intercgamma + 
+  f(INFLUENCIAgamma, model = "iid",hyper = list(prec =   list(initial = log(10^{-5}),fixed=TRUE)))+
+  f(grouped_Timegamma, model = "rw2")+
+  f(grouped_vazaogamma, model = "rw2")+
+  f(grouped_riqueza_gamma, model = "rw2")+
+  f(grouped_seasongamma,cyclic=T, model = "rw2")
+  
+I4 <- inla(f4,
+           family = c("gamma", "beta"),
+           data = inla.stack.data(Stack4),
+           control.compute = list(dic = TRUE, waic = TRUE,return.marginals.predictor=TRUE),
+           control.predictor = list(
+             A = inla.stack.A(Stack4),compute=TRUE),verbose = TRUE,num.threads = 1
+            )
+summary(I4)
+vec1=c(I4$waic$waic,
+I4$dic$dic)
+round(I4$summary.fixed,3)
+I4$summary.random$INFLUENCIAbeta
+I4$summary.random$INFLUENCIAgamma
+```
+
+
+#### Model without season {.tabset}
+
+```{r}
+f1 <- AllY~ -1+
+  Intercbeta+
+  f(INFLUENCIAbeta, model = "iid",hyper = list(prec =    list(initial =log(10^{-5}), fixed =TRUE))) + 
+  f(grouped_Timebeta,model = "rw2")+
+  f(grouped_vazaobeta, model = "rw2")+
+  Intercgamma + 
+  f(INFLUENCIAgamma, model = "iid",hyper = list(prec =   list(initial = log(10^{-5}),fixed=TRUE)))+
+  f(grouped_Timegamma, model = "rw2")+
+  f(grouped_vazaogamma, model = "rw2")+
+  f(grouped_riqueza_gamma, model = "rw2")
+  
+  
+I1 <- inla(f1,
+           family = c("gamma", "beta"),
+           data = inla.stack.data(Stack4),
+           control.compute = list(dic = TRUE, waic = TRUE,return.marginals.predictor=TRUE),
+           control.predictor = list(
+             A = inla.stack.A(Stack4),compute=TRUE),verbose = TRUE,num.threads = 1)
+summary(I1)
+vec2=c(I1$waic$waic,
+I1$dic$dic)
+```
+
+
+#### Model without vazao {.tabset}
+
+```{r}
+f2 <- AllY~ -1+
+  Intercbeta+
+  f(INFLUENCIAbeta, model = "iid",hyper = list(prec =    list(initial =log(10^{-5}), fixed =TRUE))) + 
+  f(grouped_Timebeta,model = "rw2")+
+  f(grouped_seasonbeta,cyclic=T, model = "rw2")+
+  Intercgamma + 
+  f(INFLUENCIAgamma, model = "iid",hyper = list(prec =   list(initial = log(10^{-5}),fixed=TRUE)))+
+  f(grouped_Timegamma, model = "rw2")+
+  f(grouped_riqueza_gamma, model = "rw2")+
+  f(grouped_seasongamma,cyclic=T, model = "rw2")
+
+I2 <- inla(f2,
+           family = c("gamma", "beta"),
+           data = inla.stack.data(Stack4),
+           control.compute = list(dic = TRUE, waic = TRUE,return.marginals.predictor=TRUE),
+           control.predictor = list(compute=TRUE,
+             A = inla.stack.A(Stack4),compute=TRUE),verbose = TRUE,num.threads = 1)
+summary(I2)
+vec3=c(I2$waic$waic,
+I2$dic$dic)
+```
+
+
+
+#### Model Time linear (without vazao) {.tabset}
+
+```{r}
+f5 <- AllY~ -1+
+  Intercbeta+
+  f(INFLUENCIAbeta, model = "iid",hyper = list(prec =    list(initial =log(10^{-5}), fixed =TRUE))) + 
+  Timebeta+
+  f(grouped_seasonbeta,cyclic=T, model = "rw2")+
+  Intercgamma + 
+  f(INFLUENCIAgamma, model = "iid",hyper = list(prec =   list(initial = log(10^{-5}),fixed=TRUE)))+
+  Timegamma+
+  f(grouped_riqueza_gamma, model = "rw2")+
+  f(grouped_seasongamma,cyclic=T, model = "rw2")
+
+I5 <- inla(f5,
+           family = c("gamma", "beta"),
+           data = inla.stack.data(Stack4),
+           control.compute = list(dic = TRUE, waic = TRUE,return.marginals.predictor=TRUE),
+           control.predictor = list(
+             A = inla.stack.A(Stack4),compute=TRUE),verbose = TRUE,num.threads = 1)
+summary(I5)
+vec4=c(I5$waic$waic,
+I5$dic$dic)
+```
+
+
+#### Summary {.tabset}
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+measures=rbind(vec1,vec2,vec3,vec4)
+colnames(measures)=c("waic","dic")
+rownames(measures)=c("Full model","Without Season", "Without vazao", "Time linear (without vazao)")
+measures
+```
+
+
+Best model the FULL one.
+
+
+
+### Plots {.tabset}
+
+
+#### Trend (beta) {.tabset}
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+
+library(ggplot2)
+suabinm <- I4$summary.random$grouped_Timebeta$mean
+suabin2 <- I4$summary.random$grouped_Timebeta$`0.025quant`
+suabin9 <-I4$summary.random$grouped_Timebeta$`0.975quant`
+suabinID<-I4$summary.random$grouped_Timebeta$ID
+suabin<-data.frame(suabinm, suabin2,suabin9,suabinID)
+m3<-ggplot(data = suabin, aes(x = suabinID, y = suabinm))+
+  geom_line(aes(x = suabinID, y = suabinm), color="aquamarine3", size=0.9)+
+  geom_ribbon(aes(ymin=suabin2, ymax=suabin9) ,fill="aquamarine1", alpha=0.1)+
+  ggtitle(" ")+
+  xlab("Time")+
+  ylab("Time effect (beta) ") + theme(plot.title = element_text(hjust=0.5))+ theme_classic()
+m3
+
+```
+
+
+#### Trend (gamma) {.tabset}
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+
+library(ggplot2)
+suabinm <- I4$summary.random$grouped_Timegamma$mean
+suabin2 <- I4$summary.random$grouped_Timegamma$`0.025quant`
+suabin9 <-I4$summary.random$grouped_Timegamma$`0.975quant`
+suabinID<-I4$summary.random$grouped_Timegamma$ID
+suabin<-data.frame(suabinm, suabin2,suabin9,suabinID)
+m3<-ggplot(data = suabin, aes(x = suabinID, y = suabinm))+
+  geom_line(aes(x = suabinID, y = suabinm), color="darkorange", size=0.9)+
+  geom_ribbon(aes(ymin=suabin2, ymax=suabin9) ,fill="darkgoldenrod1", alpha=0.1)+
+  ggtitle("")+
+  xlab("Time")+
+  ylab("Time effect (gamma) ")+
+  theme_light() + theme(plot.title = element_text(hjust=0.5))+theme_classic()
+m3
+```
+
+
+#### Seasonal (beta) {.tabset}
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+
+library(ggplot2)
+suabinm <- I4$summary.random$grouped_seasonbeta$mean
+suabin2 <- I4$summary.random$grouped_seasonbeta$`0.025quant`
+suabin9 <-I4$summary.random$grouped_seasonbeta$`0.975quant`
+suabinID<-I4$summary.random$grouped_seasonbeta$ID
+suabin<-data.frame(suabinm, suabin2,suabin9,suabinID)
+m3<-ggplot(data = suabin, aes(x = suabinID, y = suabinm))+
+  geom_line(aes(x = suabinID, y = suabinm), color="darkgreen", size=0.9)+
+geom_ribbon(aes(ymin=suabin2, ymax=suabin9) ,fill="darkolivegreen3", alpha=0.1)+
+  ggtitle(" ")+
+  xlab("Day")+
+  ylab("Season effect (beta) ")+
+  theme_light() + theme(plot.title = element_text(hjust=0.5))+theme_classic()
+m3
+```
+
+
+#### Seasonal (gamma) {.tabset}
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+
+library(ggplot2)
+suabinm <- I4$summary.random$grouped_seasongamma$mean
+suabin2 <- I4$summary.random$grouped_seasongamma$`0.025quant`
+suabin9 <-I4$summary.random$grouped_seasongamma$`0.975quant`
+suabinID<-I4$summary.random$grouped_seasongamma$ID
+suabin<-data.frame(suabinm, suabin2,suabin9,suabinID)
+m3<-ggplot(data = suabin, aes(x = suabinID, y = suabinm))+
+  geom_line(aes(x = suabinID, y = suabinm), color="violet", size=0.9)+
+  geom_ribbon(aes(ymin=suabin2, ymax=suabin9) ,fill="violet", alpha=0.1)+
+  ggtitle(" ")+
+  xlab("Day")+
+  ylab("Season effect (gamma) ")+
+  theme_light() + theme(plot.title = element_text(hjust=0.5))+theme_classic()
+m3
+```
+
+
+
+#### Total riqueza {.tabset}
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+
+library(ggplot2)
+suabinm <- I4$summary.random$grouped_riqueza_gamma$mean
+suabin2 <- I4$summary.random$grouped_riqueza_gamma$`0.025quant`
+suabin9 <-I4$summary.random$grouped_riqueza_gamma$`0.975quant`
+suabinID<-I4$summary.random$grouped_riqueza_gamma$ID
+suabin<-data.frame(suabinm, suabin2,suabin9,suabinID)
+m3<-ggplot(data = suabin, aes(x = suabinID, y = suabinm))+
+  geom_line(aes(x = suabinID, y = suabinm), color="gold", size=0.9)+
+  geom_ribbon(aes(ymin=suabin2, ymax=suabin9) ,fill="gold", alpha=0.15)+
+  ggtitle(" ")+
+  xlab("Richness")+
+  ylab("Richness effect (beta) ")+
+  theme_light() + theme(plot.title = element_text(hjust=0.5))+theme_classic()
+m3
+```
+
+#### River level rate {.tabset}
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+
+library(ggplot2)
+suabinm <- I4$summary.random$grouped_vazaobeta$mean
+suabin2 <- I4$summary.random$grouped_vazaobeta$`0.025quant`
+suabin9 <-I4$summary.random$grouped_vazaobeta$`0.975quant`
+suabinID<-I4$summary.random$grouped_vazaobeta$ID
+suabin<-data.frame(suabinm, suabin2,suabin9,suabinID)
+m3<-ggplot(data = suabin, aes(x = suabinID, y = suabinm))+
+  geom_line(aes(x = suabinID, y = suabinm), color="chocolate", size=0.9)+
+  geom_ribbon(aes(ymin=suabin2, ymax=suabin9) ,fill="chocolate", alpha=0.15)+
+  ggtitle(" ")+
+  xlab("River level rate ")+
+  ylab("River level rate effect (beta) ")+
+  theme_light() + theme(plot.title = element_text(hjust=0.5))+theme_classic()
+m3
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+
+library(ggplot2)
+suabinm <- I4$summary.random$grouped_vazaogamma$mean
+suabin2 <- I4$summary.random$grouped_vazaogamma$`0.025quant`
+suabin9 <-I4$summary.random$grouped_vazaogamma$`0.975quant`
+suabinID<-I4$summary.random$grouped_vazaogamma$ID
+suabin<-data.frame(suabinm, suabin2,suabin9,suabinID)
+m3<-ggplot(data = suabin, aes(x = suabinID, y = suabinm))+
+  geom_line(aes(x = suabinID, y = suabinm), color="chocolate1", size=0.9)+
+  geom_ribbon(aes(ymin=suabin2, ymax=suabin9) ,fill="chocolate1", alpha=0.15)+
+  ggtitle(" ")+
+  xlab("River level rate ")+
+  ylab("River level rate effect (gamma) ")+
+  theme_light() + theme(plot.title = element_text(hjust=0.5))+theme_classic()
+m3
+```
+
+
+## References  {.tabset}
+
+- Smithson M, Verkuilen J (2006). A better lemon squeezer? Maximum
+likelihood regression with beta-distributed dependent variables.
+Psychological Methods 11: 54–71.
+
